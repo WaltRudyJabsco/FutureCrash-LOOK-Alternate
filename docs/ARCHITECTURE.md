@@ -1,58 +1,87 @@
 # Architecture
 
-Future Crash and LOOK are one distributed environment with two modules.
-
-- LOOK owns shell/navigation/system/file/AI tooling.
-- Future Crash owns the ambient workstation/front-end experience.
-- The installer owns composition.
-
-Public commands:
-- `future-crash` / `rst` / `fcr` — front end
-- `lk` / `lo` — underlying terminal tools
-
-Future Crash's launcher reads LOOK's selected Ollama model and host, so there is one AI configuration rather than two competing configurations.
-
-## Portable intelligence
-
-LO's persistent intelligence is intentionally file-shaped:
-
 ```text
-core.md
-skills.md
-ollama_memory.json
+look/
+  paths.py            the four state layers (program · profile · machine · runtime)
+  store.py            atomic JSON, bounded JSON lines, file locks — the only writer of state
+  settings.py         declarative settings table + machine-local secrets
+  log.py              the diagnostic log
+  system.py           read-only machine facts (macOS + Linux)
+  profile.py          backup · export · restore · import from 3.x
+  shell.py            generated shell integration
+
+  kernel/
+    results.py        Result: ok · status · receipt · content · data · undo
+    tools.py          Tool declarations, Registry, Context, invoke() — the one transaction boundary
+    policy.py         profiles → capabilities, path boundary, grants, command confirmation
+    fsops.py          reversible copy / move / remove / write / create / mkdir
+    journal.py        append-only journal; undo derived from it
+    ollama.py         the only Ollama client; hosts; tailnet discovery; web search
+    lane.py           interactive leases; background work waits for people
+    prompts.py        system prompt assembly (identity · contract · access · craft · memory · environment)
+    agent.py          the agent loop, budget, ledger
+
+  mind/
+    personas.py       LO and Future Crash: voice + private mind, never permission
+    memory.py         recent ring · candidates with decay · long-term summary
+    reflect.py        one structured reflection per exchange; summary rewrite when due
+    skills.py         skills.md, Bundled + Learned
+
+  tools/              files · host · shell · inspect · edges · signal · tasks
+  daemon/
+    jobs.py           durable file queue; drain() runs identically in looked or a one-shot drainer
+    schedule.py       one scheduler for LO schedules and Future Crash threads
+    looked.py         optional resident: fires schedules, drains the queue, answers status
+    client.py         Unix-socket client
+
+  faces/
+    commands.py       the lk command registry
+    cli.py            every lk command
+    lo.py             the LO REPL and terminal UI
+    filer.py          the interactive filer
+    crash/app.py      Future Crash
+    crash/canvas.py   the Signal canvas and its drawing language
+    crash/text.py     fortunes, observations, panics, incidents
+
+  term/               ansi · keys · markdown · menu · feedback
+  extras/             optional features: register(commands, tools)
+  bundled/            core.md · skills.md · personalities · future-crash.md
 ```
 
-Application versioning and intelligence-data versioning are separate.
+## A turn, end to end
 
-- Memory has a schema version for migration.
-- Skills has a schema version plus a Bundled craft-pack version.
-- Bundled skills can be replaced independently.
-- Learned skills remain local and survive Bundled updates.
+1. A face builds an `Agent(persona, access, workspace, ui)`.
+2. `turn(text)` takes an interactive lease on the lane. Ambient work opts out with
+   `lease=False`, so it never blocks background jobs.
+3. `prompts.assemble` builds one system prompt: identity, contract, access note, craft,
+   memory context (≤8 relevant memories plus the summary and recent exchanges), and
+   environment.
+4. Tools are offered only if the model supports tools **and** the profile allows the
+   capability **and** the persona may use the tool **and** it is available (for
+   example, web search has a key).
+5. A tool call goes through `invoke()`: policy check → argument check → run → `Result`
+   → journal. The UI's `receipt()` renders it. The model gets `result.for_model()`.
+6. Identical calls are refused after two. Rounds start at 4 and grow by 4 while new calls
+   succeed, up to `lo.max_rounds`. The last round offers no tools.
+7. The turn returns `Turn(answer, results, ledger())`. Recent continuity is written now,
+   and reflection is queued.
 
-This lets LOOK stabilize while reviewed assistant craft continues to evolve without inventing a skills package manager or database.
-
-
-## LOOK 2.0 state boundary
-
-LOOK separates versioned program material from portable profile identity, machine-local trust/configuration, and disposable runtime state. See `STATE-ARCHITECTURE.md` and `PROFILE.md`.
-
-This boundary is also the long-term service contract: shell, filer, Future Crash, and future resident brokers may exchange jobs/events, while durable intelligence remains profile state.
-
-
-## Shared inference coordination (2.1.2)
-
-Living AI coordinates access to inference capacity across independent clients without merging their identities.
-
-Future Crash is an optional client. Explicit Ask/Workstation operations register a per-process interactive lease. Automatic Future Crash work requests admission to the idle background lane. LOOK's own foreground lease, queued LO jobs, Living Memory, and skill reflection retain precedence over ambient Future Crash inference.
-
-The coordination boundary is intentionally below personality, memory, permissions, and tools:
+## Background work
 
 ```text
-Future Crash Oracle ─┐
-                     ├─ Living AI inference lane ─ Ollama
-LO / LOOK ───────────┘
+enqueue(kind, payload) ──► runtime/queue/<kind>/<id>.json
+        │
+        ├─ looked running?  ──► wake it
+        └─ else             ──► spawn `python -m look _drain` (single instance via lock)
 
-identity/memory/tool state remain separate above the lane
+drain(): while files exist → wait for lane.idle() → run_one() → journal event
+         failure → attempts+1, 30 s backoff; after 5 → queue/failed/
 ```
 
-If Living AI is unavailable, Future Crash remains a direct Ollama client.
+Jobs run with `interactive=False`. Anything that would ask a person is **denied**, never guessed.
+
+## Dependencies between layers
+
+`faces → mind, tools, daemon → kernel → store, paths, settings, log`. The kernel never
+imports a face. Tools import the kernel and never import each other, except `signal`,
+which uses the canvas module.

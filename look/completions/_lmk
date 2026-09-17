@@ -1,9 +1,0 @@
-#compdef lmk mkd
-# LOOK smart-make completion. Complete existing parent directories and explicit mode flags.
-
-_lmk() {
-  _arguments -s \
-    '(-d --dir)'{-d,--dir}'[force directory + enter]' \
-    '(-f --file)'{-f,--file}'[force file creation]' \
-    '1:new path:_files -/'
-}

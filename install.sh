@@ -1,494 +1,213 @@
 #!/usr/bin/env bash
+# Future Crash + LOOK 4 installer.
+#
+#   ./install.sh                 interactive
+#   ./install.sh --yes           accept the defaults
+#   ./install.sh --dry-run       show what would happen
+#   ./install.sh --force-downgrade
+#
+# What it touches:
+#   ~/.local/share/look/program/<version>/   the program (the previous version stays for rollback)
+#   ~/.local/share/look/program/current      symlink to the active version
+#   ~/.local/bin/{lk,lo,future-crash}        three tiny launchers
+#   your shell rc                            one marked block: eval "$(lk shell-init zsh)"
+# It never touches your profile except to offer a one-time import from LOOK 3.x.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSION="$(cat "$HERE/VERSION")"
+SHARE="${XDG_DATA_HOME:-$HOME/.local/share}/look"
+PROGRAMS="$SHARE/program"
+BIN="$HOME/.local/bin"
+YES=0; DRY=0; FORCE=0; AUTOSTART=""
 
-PRODUCT_VERSION="3.3.8"
-LOOK_VERSION="4.33.8"
-FUTURE_CRASH_VERSION="1.1.14"
-
-DRY=0
-ASSUME_YES=0
-NO_OPTIONAL=0
-FORCE_DOWNGRADE=0
-BREW_BOOTSTRAPPED=0
-installed_packages=()
-created_dirs=()
-ZSH_BACKUP=""
-
-usage() {
-  cat <<'EOF'
-LOOK + FUTURE CRASH — system installer
-
-Usage:
-  ./install.sh [--dry-run] [--yes] [--no-optional] [--force-downgrade] [--uninstall]
-
-  --dry-run          show what the installer would do
-  --yes              accept optional component prompts
-  --no-optional      install without optional Remote + AI/media components
-  --force-downgrade  deliberately install over a newer unified release
-  --uninstall        remove Future Crash + LOOK owned files
-EOF
-}
-
-while (($#)); do
-  case "$1" in
+for arg in "$@"; do
+  case "$arg" in
+    --yes|-y) YES=1 ;;
     --dry-run) DRY=1 ;;
-    --yes|-y) ASSUME_YES=1 ;;
-    --no-optional) NO_OPTIONAL=1 ;;
-    --force-downgrade) FORCE_DOWNGRADE=1 ;;
-    --uninstall)
-      if command -v lk >/dev/null 2>&1; then
-        exec lk uninstall
-      fi
-      echo "LOOK is not installed; nothing to uninstall."
-      exit 0
-      ;;
-    --help|-h) usage; exit 0 ;;
-    *) echo "Unknown option: $1"; usage; exit 2 ;;
+    --force-downgrade) FORCE=1 ;;
+    --autostart) AUTOSTART=yes ;;
+    --no-autostart) AUTOSTART=no ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    *) echo "unknown option: $arg" >&2; exit 2 ;;
   esac
-  shift
 done
 
-have(){ command -v "$1" >/dev/null 2>&1; }
-run(){ if ((DRY)); then printf '  →'; printf ' %q' "$@"; printf '\n'; else "$@"; fi; }
-ask() {
-  local prompt="$1" default="$2" answer
-  if ((NO_OPTIONAL)); then return 1; fi
-  if ((ASSUME_YES)); then return 0; fi
-  if ((DRY)) || [[ ! -t 0 ]]; then
-    [[ "$default" == "Y" ]]
-    return
-  fi
-  if [[ "$default" == "Y" ]]; then
-    read -r -p "$prompt [Y/n] " answer
-    [[ ! "$answer" =~ ^[Nn] ]]
-  else
-    read -r -p "$prompt [y/N] " answer
-    [[ "$answer" =~ ^[Yy] ]]
-  fi
+bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
+ok()    { printf '  \033[38;5;121m✓\033[0m %s\n' "$*"; }
+note()  { printf '  \033[38;5;245m·\033[0m %s\n' "$*"; }
+warn()  { printf '  \033[38;5;221m!\033[0m %s\n' "$*"; }
+run()   { if ((DRY)); then printf '  \033[38;5;239m→ %s\033[0m\n' "$*"; else eval "$@"; fi; }
+ask() {  # ask "question" default(y|n)
+  local q="$1" d="${2:-y}" a
+  if ((YES)); then [[ "$d" == y ]]; return; fi
+  read -r -p "  $q [$( [[ $d == y ]] && echo Y/n || echo y/N )] " a || true
+  a="${a:-$d}"; [[ "$a" =~ ^[Yy] ]]
 }
 
-
-version_lt() {
-  local a="$1" b="$2"
-  local a1=0 a2=0 a3=0 b1=0 b2=0 b3=0
-  IFS=. read -r a1 a2 a3 <<< "${a%%[-+]*}"
-  IFS=. read -r b1 b2 b3 <<< "${b%%[-+]*}"
-  a1=${a1:-0}; a2=${a2:-0}; a3=${a3:-0}
-  b1=${b1:-0}; b2=${b2:-0}; b3=${b3:-0}
-  (( a1 < b1 )) && return 0
-  (( a1 > b1 )) && return 1
-  (( a2 < b2 )) && return 0
-  (( a2 > b2 )) && return 1
-  (( a3 < b3 ))
-}
-
-installed_release_version() {
-  local manifest="$HOME/.local/share/look/install_manifest.json"
-  [[ -f "$manifest" ]] || return 1
-  local value=""
-  value="$(sed -n 's/.*"release"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" | head -n1)"
-  if [[ -z "$value" ]]; then
-    value="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"future-crash-look-\([^"]*\)".*/\1/p' "$manifest" | head -n1)"
-  fi
-  [[ -n "$value" ]] || return 1
-  printf '%s\n' "$value"
-}
-
-preflight_version_guard() {
-  local installed=""
-  installed="$(installed_release_version || true)"
-  [[ -n "$installed" ]] || return 0
-
-  if version_lt "$PRODUCT_VERSION" "$installed"; then
-    echo
-    echo "VERSION GUARD"
-    echo "  installed: Future Crash + LOOK $installed"
-    echo "  requested: Future Crash + LOOK $PRODUCT_VERSION"
-    if ((FORCE_DOWNGRADE)); then
-      echo "  ! deliberate downgrade allowed by --force-downgrade"
-    else
-      echo "  Refusing to overwrite a newer unified installation."
-      echo "  Use --force-downgrade only if you intentionally want the older release."
-      exit 3
-    fi
-  elif [[ "$PRODUCT_VERSION" == "$installed" ]]; then
-    echo "  ✓ Future Crash + LOOK $PRODUCT_VERSION already installed; reconciling files"
-  else
-    echo "  ↑ updating Future Crash + LOOK $installed → $PRODUCT_VERSION"
-  fi
-}
-
-preflight_version_guard
-
-echo "FUTURE CRASH + LOOK $PRODUCT_VERSION — terminal environment installer"
-echo "LOOK $LOOK_VERSION · Future Crash $FUTURE_CRASH_VERSION · $(uname -s) · $(uname -m)"
+bold "FUTURE CRASH + LOOK $VERSION"
 echo
-echo "One install: LOOK underneath, Future Crash on top."
-echo "Remote access and local AI remain optional."
 
-if ! have brew; then
-  if ((DRY)); then
-    echo "✗ Homebrew/Linuxbrew (would bootstrap)"
-  else
-    echo
-    echo "BOOTSTRAP"
-    echo "  LOOK uses Homebrew/Linuxbrew as its package layer."
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    BREW_BOOTSTRAPPED=1
-    [[ -x /opt/homebrew/bin/brew ]] && eval "$(/opt/homebrew/bin/brew shellenv)"
-    [[ -x /home/linuxbrew/.linuxbrew/bin/brew ]] && eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-  fi
-fi
-
-package_for() {
-  case "$1" in
-    python3) printf '%s\n' python ;;
-    nvim) printf '%s\n' neovim ;;
-    pdftotext) printf '%s\n' poppler ;;
-    *) printf '%s\n' "$1" ;;
-  esac
-}
-
-echo
-echo "LOOK WORKSTATION"
-core=(zsh python3 git zoxide fzf fd nvim bat fortune cowsay fastfetch chafa pdftotext ttyd lsof)
-missing=()
-for c in "${core[@]}"; do
-  if have "$c"; then
-    printf '  ✓ %s\n' "$c"
-  else
-    printf '  ✗ %s\n' "$c"
-    missing+=("$(package_for "$c")")
+# ---- python -------------------------------------------------------------
+PY=""
+for cand in python3 python3.13 python3.12 python3.11 python3.10 python3.9 /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+  if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'import sys; raise SystemExit(sys.version_info < (3, 9))' 2>/dev/null; then
+    PY="$(command -v "$cand")"; break
   fi
 done
-if ((${#missing[@]})); then
-  run brew install "${missing[@]}"
-  if ((!DRY)); then installed_packages+=("${missing[@]}"); fi
+if [[ -z "$PY" ]]; then
+  warn "LOOK needs Python 3.9 or newer (no third-party packages)."
+  [[ "$(uname)" == Darwin ]] && note "install one with: xcode-select --install   (or: brew install python)"
+  exit 1
+fi
+ok "python $("$PY" -c 'import platform; print(platform.python_version())') · $PY"
+
+# ---- version guard --------------------------------------------------------
+current_version=""
+[[ -f "$PROGRAMS/current/VERSION" ]] && current_version="$(cat "$PROGRAMS/current/VERSION")"
+newer() { "$PY" -c 'import sys; a,b=[tuple(int(x) for x in v.split(".")) for v in sys.argv[1:3]]; raise SystemExit(0 if a>b else 1)' "$1" "$2"; }
+if [[ -n "$current_version" ]]; then
+  if newer "$current_version" "$VERSION" && ((FORCE == 0)); then
+    warn "installed $current_version is newer than $VERSION; use --force-downgrade to replace it"
+    exit 1
+  fi
+  note "replacing $current_version (it stays in $PROGRAMS for rollback)"
 fi
 
-# Remote is deliberately offered rather than silently assumed: installation is
-# useful only after the user authenticates this machine into a tailnet.
-echo
-echo "LOOK REMOTE"
-if have tailscale; then
-  echo "  ✓ tailscale"
+# ---- stop the coordinator before its code changes ---------------------------
+was_running=0
+if [[ -x "$BIN/lk" ]] && "$BIN/lk" ai status 2>/dev/null | grep -q "running pid"; then
+  was_running=1
+  run "\"$BIN/lk\" ai stop >/dev/null"
+  note "stopped looked for the upgrade"
+fi
+
+# ---- program --------------------------------------------------------------
+target="$PROGRAMS/$VERSION"
+run "mkdir -p \"$PROGRAMS\" \"$BIN\""
+run "rm -rf \"$target.tmp\" && mkdir -p \"$target.tmp\""
+run "cp -R \"$HERE/look\" \"$target.tmp/look\" && cp \"$HERE/VERSION\" \"$target.tmp/VERSION\""
+run "find \"$target.tmp\" -name __pycache__ -type d -prune -exec rm -rf {} +"
+run "rm -rf \"$target\" && mv \"$target.tmp\" \"$target\""
+run "ln -sfn \"$target\" \"$PROGRAMS/current.new\" && mv -f \"$PROGRAMS/current.new\" \"$PROGRAMS/current\""
+ok "program → $target"
+
+for face in lk lo future-crash; do
+  launcher="$BIN/$face"
+  body="#!/bin/sh
+# Future Crash + LOOK launcher (generated by install.sh)
+LOOK_PROGRAM=\"\${LOOK_PROGRAM:-$PROGRAMS/current}\"
+export LOOK_BIN=\"$BIN/lk\"
+PYTHONPATH=\"\$LOOK_PROGRAM\${PYTHONPATH:+:\$PYTHONPATH}\" exec \"$PY\" -m look $face \"\$@\""
+  if ((DRY)); then note "would write $launcher"; else printf '%s\n' "$body" > "$launcher"; chmod +x "$launcher"; fi
+done
+ok "launchers → $BIN/{lk,lo,future-crash}"
+case ":$PATH:" in *":$BIN:"*) ;; *) warn "$BIN is not on PATH yet; the shell block below adds it" ;; esac
+
+# ---- shell ------------------------------------------------------------------
+shell_name="$(basename "${SHELL:-zsh}")"
+[[ "$shell_name" == bash ]] && rc="$HOME/.bashrc" || { rc="$HOME/.zshrc"; shell_name=zsh; }
+begin="# >>> future-crash-look >>>"
+end="# <<< future-crash-look <<<"
+block="$begin
+export PATH=\"$BIN:\$PATH\"
+eval \"\$(\"$BIN/lk\" shell-init $shell_name)\"
+$end"
+
+if [[ -f "$rc" ]] && grep -q "# >>> LOOK Shell" "$rc"; then
+  warn "your $rc has the LOOK 3.x shell block (774 lines sourced from zshrc)"
+  if ask "replace it with the 4.0 one-liner? (a backup of $rc is kept)" y; then
+    run "cp \"$rc\" \"$rc.look3-backup.\$(date +%Y%m%d%H%M%S)\""
+    run "\"$PY\" - \"$rc\" <<'PYEOF'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+s = re.sub(r'# >>> LOOK Shell.*?# <<< LOOK Shell <<<\n?', '', s, flags=re.S)
+open(p, 'w').write(s)
+PYEOF"
+    ok "removed the 3.x block"
+  fi
+fi
+if [[ -f "$rc" ]] && grep -qF "$begin" "$rc"; then
+  ok "shell integration already in $rc"
+elif ask "add LOOK to $rc?" y; then
+  if ((DRY)); then note "would append to $rc:"; printf '%s\n' "$block" | sed 's/^/      /'; else printf '\n%s\n' "$block" >> "$rc"; fi
+  ok "shell integration → $rc"
 else
-  echo "  webterm() can expose this shell securely to your own devices."
-  if ask "  Install Tailscale?" Y; then
-    run brew install tailscale
-    if ((!DRY)); then installed_packages+=("tailscale"); fi
+  note "add this yourself when you are ready:"; printf '%s\n' "$block" | sed 's/^/      /'
+fi
+
+# ---- profile ------------------------------------------------------------------
+if ((DRY == 0)); then "$BIN/lk" version >/dev/null; fi
+legacy="$HOME/.local/share/look/ollama_memory.json"
+if [[ -f "$legacy" ]] && [[ ! -f "$SHARE/profile/.imported-3x" ]]; then
+  echo
+  bold "Your LOOK 3.x memory, skills and settings"
+  if ((DRY)); then note "would offer: lk profile import-3x"
   else
-    echo "  · skipped tailscale"
+    "$BIN/lk" profile import-3x --dry-run | sed 's/^/  /'
+    if ask "import them now? (3.x files are left untouched)" y; then
+      "$BIN/lk" profile import-3x | sed 's/^/  /'
+      date > "$SHARE/profile/.imported-3x"
+    fi
   fi
 fi
 
-# Ollama is a larger choice. LOOK supports it deeply but does not require it.
+# ---- inference ------------------------------------------------------------------
 echo
-echo "LOOK AI"
-if have ollama; then
-  echo "  ✓ ollama"
+if command -v ollama >/dev/null 2>&1; then
+  ok "ollama $(ollama --version 2>/dev/null | awk '{print $NF}')"
 else
-  echo "  lo adds local chat, workspace tools, memory, search, and PDF reading."
-  if ask "  Install Ollama?" N; then
-    run brew install ollama
-    if ((!DRY)); then installed_packages+=("ollama"); fi
-  else
-    echo "  · skipped ollama"
+  warn "Ollama is not installed. LOOK's file and machine tools work without it; LO and the Oracle need it."
+  [[ "$(uname)" == Darwin ]] && note "brew install ollama   or   https://ollama.com/download" || note "curl -fsSL https://ollama.com/install.sh | sh"
+  note "or point LOOK at another machine: lk hosts add desk http://desk:11434 && lk hosts use desk"
+fi
+command -v tailscale >/dev/null 2>&1 && ok "tailscale present · lk hosts discover finds Ollama on your tailnet"
+
+# ---- autostart looked --------------------------------------------------------------
+if [[ -z "$AUTOSTART" ]]; then
+  if ask "start looked at login? (fires schedules; background work always yields to you)" n; then AUTOSTART=yes; else AUTOSTART=no; fi
+fi
+if [[ "$AUTOSTART" == yes ]]; then
+  if [[ "$(uname)" == Darwin ]]; then
+    plist="$HOME/Library/LaunchAgents/com.futurecrash.looked.plist"
+    body="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\"><dict>
+  <key>Label</key><string>com.futurecrash.looked</string>
+  <key>ProgramArguments</key><array><string>$BIN/lk</string><string>looked</string></array>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+  <key>StandardErrorPath</key><string>/tmp/looked.err</string>
+</dict></plist>"
+    if ((DRY)); then note "would write $plist"; else
+      mkdir -p "$(dirname "$plist")"; printf '%s\n' "$body" > "$plist"
+      launchctl unload "$plist" 2>/dev/null || true; launchctl load "$plist"
+    fi
+    ok "looked starts at login (launchd)"
+  elif command -v systemctl >/dev/null 2>&1; then
+    unit="$HOME/.config/systemd/user/looked.service"
+    body="[Unit]
+Description=Future Crash + LOOK coordinator
+[Service]
+ExecStart=$BIN/lk looked
+Restart=on-failure
+[Install]
+WantedBy=default.target"
+    if ((DRY)); then note "would write $unit"; else
+      mkdir -p "$(dirname "$unit")"; printf '%s\n' "$body" > "$unit"
+      systemctl --user daemon-reload && systemctl --user enable --now looked.service
+    fi
+    ok "looked starts at login (systemd --user)"
   fi
+elif ((was_running)); then
+  run "\"$BIN/lk\" ai start >/dev/null" && ok "restarted looked"
 fi
 
-# On a Linux NVIDIA workstation, LOOK can own a clean isolated ComfyUI service.
-# Discovery runs before install so old model libraries on mounted drives can be reused.
+# ---- done ------------------------------------------------------------------------
 echo
-echo "LOOK GENERATIVE MEDIA"
-if [[ "$(uname -s)" == "Linux" ]] && have nvidia-smi; then
-  gpu_line="$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>/dev/null | head -n1 || true)"
-  echo "  ✓ NVIDIA GPU${gpu_line:+ · $gpu_line}"
-  echo "  ComfyUI enables local image generation; old model folders can be reused without copying."
-  if ask "  Set up local ComfyUI image generation on this GPU?" Y; then
-    comfy_args=(--install)
-    ((ASSUME_YES)) && comfy_args+=(--yes)
-    if ((DRY)); then
-      echo "  → python3 $ROOT/look/comfy_bootstrap.py ${comfy_args[*]}"
-    else
-      python3 "$ROOT/look/comfy_bootstrap.py" "${comfy_args[@]}"
-    fi
-  else
-    echo "  · skipped ComfyUI setup"
-  fi
-else
-  echo "  · no Linux NVIDIA GPU detected on this machine"
-  echo "  A client can still use ComfyUI hosted on another LOOK machine."
-fi
-
-ZDIR="${ZSH:-$HOME/.oh-my-zsh}"
-if [[ ! -d "$ZDIR" ]]; then
-  run git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git "$ZDIR"
-  if ((!DRY)); then created_dirs+=("$ZDIR"); fi
-fi
-CUSTOM="${ZSH_CUSTOM:-$ZDIR/custom}"
-clone() {
-  if [[ ! -d "$2" ]]; then
-    run git clone --depth=1 "$1" "$2"
-    if ((!DRY)); then created_dirs+=("$2"); fi
-  fi
-}
-clone https://github.com/romkatv/powerlevel10k.git "$CUSTOM/themes/powerlevel10k"
-clone https://github.com/zsh-users/zsh-autosuggestions.git "$CUSTOM/plugins/zsh-autosuggestions"
-clone https://github.com/zsh-users/zsh-syntax-highlighting.git "$CUSTOM/plugins/zsh-syntax-highlighting"
-
-if have lk; then
-  existing_lk="$(command -v lk)"
-  case "$existing_lk" in
-    "$HOME/.local/bin/lk"|"$HOME/.local/share/look/lk") ;;
-    *)
-      echo "WARNING: 'lk' already exists at: $existing_lk"
-      echo "LOOK will install ~/.local/bin/lk; review this collision if that command matters to you."
-      ;;
-  esac
-fi
-
-run mkdir -p "$HOME/.local/share/look" "$HOME/.local/bin"
-
-# A resident Living AI process has imported the currently installed LOOK code.
-# Stop it BEFORE replacing those files so an upgrade can never leave old policy
-# executing against new on-disk state.
-if ((!DRY)); then
-  OLD_LOOK="$HOME/.local/share/look/lk"
-  if [[ -x "$OLD_LOOK" ]]; then
-    "$OLD_LOOK" ai stop >/dev/null 2>&1 || true
-    for _ in {1..50}; do
-      [[ ! -S "$HOME/.local/share/look/ai.sock" && ! -f "$HOME/.local/share/look/ai.pid" ]] && break
-      sleep 0.05
-    done
-  fi
-
-  MEMORY="$HOME/.local/share/look/ollama_memory.json"
-  if [[ ! -f "$MEMORY" ]]; then
-    printf '{"long":"","recent":[]}\n' > "$MEMORY"
-    chmod 600 "$MEMORY"
-  fi
-fi
-
-run cp "$ROOT/look/lk" "$HOME/.local/share/look/lk"
-run cp "$ROOT/look/look_renderer.py" "$HOME/.local/share/look/look_renderer.py"
-run cp "$ROOT/look/look_ai.py" "$HOME/.local/share/look/look_ai.py"
-run cp "$ROOT/look/comfy_bootstrap.py" "$HOME/.local/share/look/comfy_bootstrap.py"
-run chmod +x "$HOME/.local/share/look/look_ai.py" "$HOME/.local/share/look/comfy_bootstrap.py"
-run mkdir -p "$HOME/.local/share/look/workflows"
-run cp "$ROOT/look/workflows/sdxl-api.json" "$HOME/.local/share/look/workflows/sdxl-api.json"
-run chmod +x "$HOME/.local/share/look/lk"
-if ((!DRY)); then
-  ln -sfn "$HOME/.local/share/look/lk" "$HOME/.local/bin/lk"
-  # Start the newly installed broker now. The shell hook remains a fallback.
-  "$HOME/.local/share/look/lk" ai start >/dev/null 2>&1 || true
-fi
-
-LOOK_ZSH_DIR="$HOME/.config/look"
-LOOK_ZSH_FILE="$LOOK_ZSH_DIR/look.zsh"
-LOOK_HOOK_START="# >>> LOOK Shell >>>"
-LOOK_HOOK_END="# <<< LOOK Shell <<<"
-
-run mkdir -p "$LOOK_ZSH_DIR"
-
-if [[ -f "$HOME/.zshrc" ]]; then
-  B="$HOME/.zshrc.backup.$(date +%Y%m%d-%H%M%S)"
-  run cp "$HOME/.zshrc" "$B"
-  ZSH_BACKUP="$B"
-  echo "Backed up ~/.zshrc → $B"
-fi
-
-# LOOK owns this fragment; the user's ~/.zshrc remains theirs.
-run cp "$ROOT/look/zshrc" "$LOOK_ZSH_FILE"
-run mkdir -p "$LOOK_ZSH_DIR/completions"
-run cp "$ROOT/look/completions/_lk" "$LOOK_ZSH_DIR/completions/_lk"
-run cp "$ROOT/look/completions/_lo" "$LOOK_ZSH_DIR/completions/_lo"
-run cp "$ROOT/look/completions/_lmk" "$LOOK_ZSH_DIR/completions/_lmk"
-
-if ((!DRY)); then
-  touch "$HOME/.zshrc"
-  python3 - "$HOME/.zshrc" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-text = path.read_text() if path.exists() else ""
-start = "# >>> LOOK Shell >>>"
-end = "# <<< LOOK Shell <<<"
-
-while start in text:
-    a = text.find(start)
-    b = text.find(end, a)
-    if b < 0:
-        text = text[:a].rstrip() + "\n"
-        break
-    b += len(end)
-    left = text[:a].rstrip()
-    right = text[b:].lstrip("\n")
-    text = (left + "\n\n" if left else "") + right
-
-hook = """# >>> LOOK Shell >>>
-[[ -f "$HOME/.config/look/look.zsh" ]] && source "$HOME/.config/look/look.zsh"
-# <<< LOOK Shell <<<
-"""
-text = text.rstrip()
-if text:
-    text += "\n\n"
-text += hook
-path.write_text(text)
-PY
-fi
-
-[[ -f "$HOME/.zsh_secrets" ]] || run cp "$ROOT/look/zsh_secrets.example" "$HOME/.zsh_secrets"
-run chmod 600 "$HOME/.zsh_secrets"
-
-if ((!DRY)); then
-  zsh -n "$LOOK_ZSH_FILE"
-  zsh -n "$HOME/.zshrc"
-
-  # Seed LO intelligence without overwriting local memory or learned craft.
-  LOOK_STATE="$HOME/.local/share/look"
-  run mkdir -p "$LOOK_STATE"
-  [[ -f "$LOOK_STATE/core.md" ]] || run cp "$ROOT/look/core.md" "$LOOK_STATE/core.md"
-  [[ -f "$LOOK_STATE/skills.md" ]] || run cp "$ROOT/look/skills.md" "$LOOK_STATE/skills.md"
-  run mkdir -p "$LOOK_STATE/personalities"
-  # Bundled personalities are release-owned instruction packs; user selection is stored separately.
-  for personality in "$ROOT"/look/personalities/*.md; do
-    [[ -f "$personality" ]] && run cp "$personality" "$LOOK_STATE/personalities/"
-  done
-  [[ -f "$LOOK_STATE/ollama_memory.json" ]] || run cp "$ROOT/look/memory.json" "$LOOK_STATE/ollama_memory.json"
-
-  FUTURE_DIR="$HOME/.local/share/future-crash"
-  run mkdir -p "$FUTURE_DIR"
-  run cp "$ROOT/future-crash/future_crash.py" "$FUTURE_DIR/future_crash.py"
-run cp "$ROOT/future-crash/personality.md" "$FUTURE_DIR/personality.md"
-  run cp "$ROOT/future-crash/future-crash" "$HOME/.local/bin/future-crash"
-  run chmod +x "$HOME/.local/bin/future-crash"
-
-  # Record only what this installer can prove it added. `lk uninstall` uses
-  # this manifest so it never guesses that a pre-existing package belongs to LOOK.
-  export LOOK_MANIFEST_PACKAGES="$(printf '%s\n' "${installed_packages[@]-}")"
-  export LOOK_MANIFEST_DIRS="$(printf '%s\n' "${created_dirs[@]-}")"
-  export LOOK_MANIFEST_ZSH_BACKUP="$ZSH_BACKUP"
-  export LOOK_MANIFEST_BREW_BOOTSTRAPPED="$BREW_BOOTSTRAPPED"
-  export FCL_RELEASE_VERSION="$PRODUCT_VERSION"
-  export FCL_LOOK_VERSION="$LOOK_VERSION"
-  export FCL_FUTURE_CRASH_VERSION="$FUTURE_CRASH_VERSION"
-  python3 - <<'PY'
-import json, os
-from pathlib import Path
-
-state = Path.home()/".local/share/look"
-state.mkdir(parents=True, exist_ok=True)
-old = {}
-old_path = state/"install_manifest.json"
-try:
-    old = json.loads(old_path.read_text())
-except Exception:
-    old = {}
-
-old_packages = old.get("packages") if isinstance(old.get("packages"), list) else []
-old_dirs = old.get("created_dirs") if isinstance(old.get("created_dirs"), list) else []
-
-manifest = {
-    "product": "future-crash-look",
-    "release": os.environ.get("FCL_RELEASE_VERSION", "3.1.0"),
-    "components": {
-        "look": os.environ.get("FCL_LOOK_VERSION", "4.31.0"),
-        "future_crash": os.environ.get("FCL_FUTURE_CRASH_VERSION", "1.1.14"),
-    },
-    "packages": sorted(set(old_packages + [x for x in os.environ.get("LOOK_MANIFEST_PACKAGES","").splitlines() if x])),
-    "created_dirs": sorted(set(old_dirs + [x for x in os.environ.get("LOOK_MANIFEST_DIRS","").splitlines() if x])),
-    "zsh_backup": os.environ.get("LOOK_MANIFEST_ZSH_BACKUP","") or old.get("zsh_backup",""),
-    "brew_bootstrapped": (os.environ.get("LOOK_MANIFEST_BREW_BOOTSTRAPPED","0") == "1") or bool(old.get("brew_bootstrapped", False)),
-}
-tmp = state/"install_manifest.json.tmp"
-tmp.write_text(json.dumps(manifest, indent=2) + "\n")
-tmp.chmod(0o600)
-tmp.replace(state/"install_manifest.json")
-PY
-
-  # Optional reference terminal experience. Core remains independent.
-  TERMINAL_OS="$(uname -s 2>/dev/null || echo unknown)"
-  echo
-  echo "TERMINAL EXPERIENCE"
-  if [[ "$TERMINAL_OS" == "Darwin" ]]; then
-    echo "  Recommended: iTerm2 · Zsh · Powerlevel10k · MesloLGS NF"
-  else
-    echo "  Recommended: Kitty · Zsh · Powerlevel10k · MesloLGS NF"
-  fi
-  echo "  Future Crash + LOOK works without these."
-  echo
-  if ask "  Install/check recommended terminal components?" N; then
-    if [[ "$TERMINAL_OS" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
-      [[ -d "/Applications/iTerm.app" || -d "$HOME/Applications/iTerm.app" ]] \
-        && echo "  ✓ iTerm2" \
-        || run brew install --cask iterm2
-      if system_profiler SPFontsDataType 2>/dev/null | grep -qi "MesloLGS"; then
-        echo "  ✓ MesloLGS NF"
-      else
-        echo "  Installing MesloLGS NF…"
-        if [[ "${DRY_RUN:-0}" == "1" ]]; then
-          echo "  [dry-run] brew install --cask font-meslo-lg-nerd-font"
-        else
-          brew install --cask font-meslo-lg-nerd-font || echo "  Optional font install failed; continuing."
-        fi
-      fi
-    elif [[ "$TERMINAL_OS" != "Darwin" ]]; then
-      if command -v kitty >/dev/null 2>&1; then
-        echo "  ✓ Kitty"
-      elif command -v apt-get >/dev/null 2>&1; then
-        run sudo apt-get install -y kitty
-      elif command -v dnf >/dev/null 2>&1; then
-        run sudo dnf install -y kitty
-      elif command -v pacman >/dev/null 2>&1; then
-        run sudo pacman -S --noconfirm kitty
-      else
-        echo "  Kitty not found; install it with your distribution's package manager."
-      fi
-      if command -v fc-list >/dev/null 2>&1 && fc-list | grep -qi "MesloLGS"; then
-        echo "  ✓ MesloLGS NF"
-      else
-        echo "  MesloLGS NF recommended; font installation left user-controlled on Linux."
-      fi
-    fi
-
-    if [[ -d "${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/themes/powerlevel10k" \
-       || -d "$HOME/powerlevel10k" || -d "$HOME/.powerlevel10k" ]]; then
-      echo "  ✓ Powerlevel10k"
-    else
-      echo "  Powerlevel10k recommended; prompt configuration remains user-owned."
-    fi
-    echo "  Terminal/font preferences remain untouched."
-  fi
-
-  echo
-  echo "LOOK + FUTURE CRASH installed."
-  echo "  future-crash  # launch the workstation"
-  echo "  rst           # same launch, after exec zsh"
-  echo "  fcr           # short Future Crash launcher"
-  echo "  lk            # LOOK shell"
-  echo "  lo            # LOOK Ollama"
-  echo "  lk settings   # configure AI / hosts / access"
-  echo "  lk comfy discover   # optional: find an older ComfyUI install/models"
-  echo "  lk schedule         # persistent delayed/recurring LO jobs"
-  echo "  lk shortcuts  # inspect optional shell shortcut collisions/policy"
-  echo
-  echo "  1. exec zsh"
-  echo "  2. lk doctor"
-  echo "  3. future-crash"
-  echo
-  echo "Reference: lk help"
-fi
-
-
-# User-owned man page: no sudo, and harmless if the source is absent.
-LOOK_MAN_SRC="$ROOT/look/lk.1"
-LOOK_MAN_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/man/man1"
-if [[ -f "$LOOK_MAN_SRC" ]]; then
-  run mkdir -p "$LOOK_MAN_DIR"
-  run cp "$LOOK_MAN_SRC" "$LOOK_MAN_DIR/lk.1"
-fi
-
+((DRY)) || "$BIN/lk" doctor || true
+echo
+bold "Next"
+echo "  exec $shell_name        reload your shell"
+echo "  future-crash      the front door"
+echo "  lk help           the few commands worth remembering"
