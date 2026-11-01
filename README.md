@@ -1,5 +1,29 @@
 # FUTURE CRASH + LOOK 4
 
+## This repository today
+
+This is the separate **4.0.0 modular rewrite**, with its own architecture and
+installer. It is distinct from the combined application in
+[FutureCrash-LOOK](https://github.com/WaltRudyJabsco/FutureCrash-LOOK); version numbers do not express compatibility between
+the two implementations. Existing source and configuration are preserved.
+
+From a source checkout, inspect its own command registry before installing:
+
+```sh
+python3 -m look lk commands
+python3 -m look lk help
+```
+
+This entry point uses `help`, rather than `--help`.
+[Command reference](docs/CLI.md) is generated from the executable registry.
+Run `python3 tools/command_reference.py --check` to detect drift.
+
+![Alternate command registry](docs/screenshots/Commands.png)
+
+Fresh capture from this checkout using an isolated demo home. Generated Python
+bytecode and Finder metadata are excluded from version control; the source
+modules remain intact.
+
 **A local-first AI terminal environment for macOS and Linux.**
 Python 3.9+ standard library only. Your models, through Ollama, on your machine or one you trust.
 
